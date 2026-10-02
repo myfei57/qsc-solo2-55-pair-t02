@@ -80,6 +80,21 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     tracking_after_manual = platform.track(args.dni, args.minute)
     released = platform.release_manual(args.mirror)
     washing = platform.wash(["m021", "m022", "m023"], "maint-north")
+    # 检修作业避让：开一张动火票 → 推进位置（立即重算）→ 正常完成放回。
+    maint_open = platform.open_maintenance(
+        "DEMO-MAINT",
+        start_minute=args.minute - 5.0,
+        end_minute=args.minute + 60.0,
+        x_m=0.0,
+        y_m=160.0,
+        radius_m=20.0,
+        kind="hot_work",
+        minute_of_day=args.minute,
+    )
+    maint_move = platform.report_maintenance_position(
+        "DEMO-MAINT", -152.0, 62.0, minute_of_day=args.minute
+    )
+    maint_done = platform.complete_maintenance("DEMO-MAINT", minute_of_day=args.minute)
     handoff = platform.changeover()
     disturbance = platform.disturb_steam(0.6)
 
@@ -113,6 +128,13 @@ def _cmd_demo(args: argparse.Namespace) -> int:
             "violations": tracking_after_manual["violations"],
         },
         "washing": {key: washing[key] for key in ("ok", "washed", "mirrors", "violations")},
+        "maintenance": {
+            "opened": maint_open["job_id"],
+            "kind": maint_open["kind"],
+            "final_position": maint_move["position"],
+            "final_state": maint_done["state"],
+            "held_after_complete": platform.maintenance.held(),
+        },
         "handoff": {key: handoff[key] for key in ("ok", "peak_pressure_mpa", "max_pumps_running", "violations")},
         "disturbance": disturbance,
         "trip": {key: trip[key] for key in ("ok", "latched", "violations")},

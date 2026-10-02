@@ -117,6 +117,12 @@ class FieldLimits:
     dispatch_rate_pct_s: float
     sweep_batch: int
     safe_zone_margin_m: float
+    maintenance_lead_s: float = 120.0
+    maintenance_reach_m: float = 24.0
+    maintenance_crew_speed_m_s: float = 0.5
+    maintenance_crew_expansion_max_m: float = 30.0
+    maintenance_sample_step_s: float = 15.0
+    maintenance_position_stale_s: float = 60.0
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "FieldLimits":
@@ -125,6 +131,18 @@ class FieldLimits:
             dispatch_rate_pct_s=_number(section, "dispatch_rate_pct_s", minimum=0.1),
             sweep_batch=_integer(section, "sweep_batch", minimum=1),
             safe_zone_margin_m=_number(section, "safe_zone_margin_m", minimum=0.0),
+            maintenance_lead_s=_number(section, "maintenance_lead_s", minimum=0.0),
+            maintenance_reach_m=_number(section, "maintenance_reach_m", minimum=1.0),
+            maintenance_crew_speed_m_s=_number(
+                section, "maintenance_crew_speed_m_s", minimum=0.0
+            ),
+            maintenance_crew_expansion_max_m=_number(
+                section, "maintenance_crew_expansion_max_m", minimum=0.0
+            ),
+            maintenance_sample_step_s=_number(section, "maintenance_sample_step_s", minimum=1.0),
+            maintenance_position_stale_s=_number(
+                section, "maintenance_position_stale_s", minimum=1.0
+            ),
         )
 
 
@@ -345,7 +363,7 @@ def default_config() -> PlatformConfig:
         storage_root="var/state",
         heliostat=HeliostatLimits(0.6, 1.2, 0.9, 12.0, 450.0, 0.94),
         irradiance=IrradianceLimits(250.0, 1100.0, 30.0, 180.0),
-        field=FieldLimits(320.0, 6.0, 12, 6.0),
+        field=FieldLimits(320.0, 6.0, 12, 6.0, 120.0, 24.0, 0.5, 30.0, 15.0, 60.0),
         receiver=ReceiverLimits(600.0, 620.0, 720.0, 42.0, 20.0, 8.0, 22.0),
         salt=SaltLimits(18.0, 96.0, 1.4, 15.0, 58.0, 9.0, 2.5, 3.4),
         steam=SteamLimits(12.0, 0.8, 6.0, 30.0, 1.0),
@@ -379,6 +397,12 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "dispatch_rate_pct_s": cfg.field.dispatch_rate_pct_s,
                 "sweep_batch": cfg.field.sweep_batch,
                 "safe_zone_margin_m": cfg.field.safe_zone_margin_m,
+                "maintenance_lead_s": cfg.field.maintenance_lead_s,
+                "maintenance_reach_m": cfg.field.maintenance_reach_m,
+                "maintenance_crew_speed_m_s": cfg.field.maintenance_crew_speed_m_s,
+                "maintenance_crew_expansion_max_m": cfg.field.maintenance_crew_expansion_max_m,
+                "maintenance_sample_step_s": cfg.field.maintenance_sample_step_s,
+                "maintenance_position_stale_s": cfg.field.maintenance_position_stale_s,
             },
             "receiver": {
                 "temp_target_c": cfg.receiver.temp_target_c,

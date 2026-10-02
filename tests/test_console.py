@@ -100,7 +100,7 @@ def test_pages_render_for_every_path(platform):
         html = render_page(path, platform)
         assert html is not None
         assert html.startswith("<!doctype html>")
-        assert "镜场控制台" in html or "吸热器控制台" in html or "熔盐控制台" in html or "告警控制台" in html
+        assert "镜场控制台" in html or "吸热器控制台" in html or "熔盐控制台" in html or "告警控制台" in html or "检修避让控制台" in html
     assert render_page("/nope", platform) is None
 
 
@@ -123,3 +123,81 @@ def test_server_serves_api_and_pages(platform):
     assert probe["/"]["ok"] is True
     assert probe["/api/nope"]["ok"] is False
     assert server.port == 0
+
+
+def test_api_maintenance_lifecycle(platform):
+    """检修作业开/推进/完成经 API 全程可走，状态端点反映退出与放回。"""
+
+    platform.start()
+    api = Api(platform)
+    api.handle("POST", "/api/track", {}, {"dni_w_m2": 800.0, "minute_of_day": 720.0})
+
+    status, opened = api.handle(
+        "POST",
+        "/api/maintenance/open",
+        {},
+        {
+            "job_id": "JOB-A",
+            "start_minute": 715.0,
+            "end_minute": 800.0,
+            "x_m": 0.0,
+            "y_m": 160.0,
+            "radius_m": 20.0,
+            "kind": "hot_work",
+            "minute_of_day": 720.0,
+        },
+    )
+    assert status == 200 and opened["state"] == "active"
+
+    status, maint = api.handle("GET", "/api/maintenance", {}, {})
+    assert status == 200
+    assert "m021" in maint["held"] and maint["held_count"] >= 1
+
+    # 动火作业位置变化立即生效。
+    north = set(maint["held"])
+    status, moved = api.handle(
+        "POST",
+        "/api/maintenance/position",
+        {},
+        {"job_id": "JOB-A", "x_m": -152.0, "y_m": 62.0, "minute_of_day": 720.0},
+    )
+    assert status == 200
+    status, maint2 = api.handle("GET", "/api/maintenance", {}, {})
+    assert set(maint2["held"]) != north
+
+    status, completed = api.handle(
+        "POST", "/api/maintenance/complete", {}, {"job_id": "JOB-A", "minute_of_day": 720.0}
+    )
+    assert status == 200 and completed["state"] == "completed"
+    status, maint3 = api.handle("GET", "/api/maintenance", {}, {})
+    assert maint3["held"] == []
+
+
+def test_api_maintenance_interrupt_holds(platform):
+    """作业中断经 API 后镜子维持退出（部分失败/未完成）。"""
+
+    platform.start()
+    api = Api(platform)
+    api.handle("POST", "/api/track", {}, {"dni_w_m2": 800.0, "minute_of_day": 720.0})
+    api.handle(
+        "POST",
+        "/api/maintenance/open",
+        {},
+        {
+            "job_id": "JOB-B",
+            "start_minute": 715.0,
+            "end_minute": 800.0,
+            "x_m": 0.0,
+            "y_m": 160.0,
+            "minute_of_day": 720.0,
+        },
+    )
+    status, maint = api.handle("GET", "/api/maintenance", {}, {})
+    held = set(maint["held"])
+    assert held
+    status, interrupted = api.handle(
+        "POST", "/api/maintenance/interrupt", {}, {"job_id": "JOB-B", "minute_of_day": 720.0}
+    )
+    assert status == 200 and interrupted["state"] == "interrupted"
+    status, maint2 = api.handle("GET", "/api/maintenance", {}, {})
+    assert set(maint2["held"]) == held

@@ -29,6 +29,10 @@ from .heliostat.registry import Heliostat, HeliostatRegistry
 from .heliostat.sun import SunModel, SunPosition
 from .heliostat.zone import ZoneGuard
 from .ids import IdFactory
+from .maintenance.controller import MaintenanceController
+from .maintenance.footprint import BeamSweepModel, SweepConfig
+from .maintenance.persist import MaintenancePersistence
+from .maintenance.registry import JobRegistry
 from .ns.registry import NamespaceRegistry
 from .ns.topology import Topology, build_default_topology
 from .ns.zones import SafeZone, ZoneRegistry
@@ -161,6 +165,27 @@ class Platform:
         )
 
         self.sun_model = SunModel()
+
+        # 检修作业避让：几何模型按镜场台账、瞄准点与太阳模型算镜斑；执行器复用
+        # FieldController 的退出/放回接口；事件走总线，与审计/控制台同源。
+        sweep_config = SweepConfig(
+            lead_s=self.config.field.maintenance_lead_s,
+            reach_m=self.config.field.maintenance_reach_m,
+            margin_m=self.config.field.safe_zone_margin_m,
+            crew_speed_m_s=self.config.field.maintenance_crew_speed_m_s,
+            sample_step_s=self.config.field.maintenance_sample_step_s,
+            max_crew_expansion_m=self.config.field.maintenance_crew_expansion_max_m,
+        )
+        self.maintenance = MaintenanceController(
+            actuator=_FieldMaintenanceAdapter(self.field),
+            sun_model=self.sun_model,
+            sweep_model=BeamSweepModel(self.heliostats, AimPoint(0.0, 0.0, AIM_POINT_Z_M), self.sun_model, sweep_config),
+            persistence=MaintenancePersistence(store),
+            position_stale_after_s=self.config.field.maintenance_position_stale_s,
+            event_sink=self._maintenance_event,
+        )
+        self.maintenance.restore()
+
         self.solar = ClearSkyProfile(peak_dni_w_m2=950.0)
         self.ambient = AmbientModel()
         self.temperature_profile = TemperatureProfile(
@@ -584,6 +609,10 @@ class Platform:
             self.steam.track_load(load_target_mw)
             steam_report = self.steam.update(power_kw, dt)
             alarms = self._evaluate_alarms(moment)
+            # 常规检修作业的位置变化在这里统一下一轮生效；动火作业在上报时已立即重算。
+            maintenance = self.maintenance.run_cycle(
+                moment, minute_of_day=(moment / 60.0) % 1440.0
+            ).as_dict()
             self.trend.append("receiver_temperature", moment, self.receiver.output_temperature_c())
             self.trend.append("salt_flow_kg_s", moment, self.salt.flow_kg_s())
             self.trend.append("steam_pressure_mpa", moment, self.steam.pressure.value_mpa())
@@ -596,6 +625,12 @@ class Platform:
                 "steam": steam_report,
                 "dispatch_pct": round(dispatch_pct, 3),
                 "alarms": [event.as_dict() for event in alarms],
+                "maintenance": {
+                    "held": maintenance["plan"]["held"],
+                    "exits": maintenance["plan"]["exits"],
+                    "returns": maintenance["plan"]["returns"],
+                    "partial": maintenance["partial"],
+                },
                 "state": self.receiver.state(),
             }
 
@@ -770,6 +805,7 @@ class Platform:
                 "rules": self.rules.names(),
             },
             "levels": self.alert_levels(),
+            "maintenance": self.maintenance.status(),
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),
             "ids_issued": self.ids.issued(),
@@ -794,6 +830,107 @@ class Platform:
 
         return self.field.sweeps.active_mirrors()
 
+    # ---- 检修作业避让 -------------------------------------------------
+
+    def _maintenance_event(self, action: str, severity: str, message: str, payload: dict) -> None:
+        """把检修避让协调器的事件投到总线（审计自动落盘、控制台可读）。"""
+
+        asset = ""
+        job_id = payload.get("job_id")
+        if isinstance(job_id, str):
+            asset = job_id
+        self.bus.publish(
+            Event.of(
+                "maintenance",
+                "maintenance",
+                action,
+                asset=asset,
+                severity=severity,
+                message=message,
+                **_audit_clean(payload),
+            )
+        )
+
+    def open_maintenance(
+        self,
+        job_id: str,
+        *,
+        start_minute: float,
+        end_minute: float,
+        x_m: float,
+        y_m: float,
+        radius_m: float = 20.0,
+        zone: str = "maintenance",
+        kind: str = "routine",
+        minute_of_day: float | None = None,
+    ) -> dict:
+        """开一张检修作业票（时间用当日分钟，换算成平台秒）。"""
+
+        now = self.clock.now()
+        minute = self._minute_now() if minute_of_day is None else float(minute_of_day)
+        job = self.maintenance.open_job(
+            job_id,
+            scheduled_start=now + (start_minute - minute) * 60.0,
+            scheduled_end=now + (end_minute - minute) * 60.0,
+            start_x_m=x_m,
+            start_y_m=y_m,
+            radius_m=radius_m,
+            zone=zone,
+            kind=kind,
+            now=now,
+            minute_of_day=minute,
+        )
+        return job.as_dict()
+
+    def report_maintenance_position(
+        self,
+        job_id: str,
+        x_m: float,
+        y_m: float,
+        minute_of_day: float | None = None,
+    ) -> dict:
+        """上报作业推进到的实际位置（动火类立即重算，常规类下一轮生效）。"""
+
+        minute = self._minute_now() if minute_of_day is None else float(minute_of_day)
+        job = self.maintenance.report_position(
+            job_id, x_m, y_m, self.clock.now(), minute_of_day=minute
+        )
+        return job.as_dict()
+
+    def complete_maintenance(self, job_id: str, minute_of_day: float | None = None) -> dict:
+        """正常完成作业，镜子确认光斑离开后放回。"""
+
+        minute = self._minute_now() if minute_of_day is None else float(minute_of_day)
+        return self.maintenance.complete_job(
+            job_id, self.clock.now(), minute_of_day=minute
+        ).as_dict()
+
+    def interrupt_maintenance(self, job_id: str, minute_of_day: float | None = None) -> dict:
+        """中断作业——按未完成处理，镜子维持退出。"""
+
+        minute = self._minute_now() if minute_of_day is None else float(minute_of_day)
+        return self.maintenance.interrupt_job(
+            job_id, self.clock.now(), minute_of_day=minute
+        ).as_dict()
+
+    def resume_maintenance(self, job_id: str, minute_of_day: float | None = None) -> dict:
+        """恢复中断的作业。"""
+
+        minute = self._minute_now() if minute_of_day is None else float(minute_of_day)
+        return self.maintenance.resume_job(
+            job_id, self.clock.now(), minute_of_day=minute
+        ).as_dict()
+
+    def maintenance_cycle(self, minute_of_day: float | None = None) -> dict:
+        """手动推进一个检修避让周期（常规作业靠它重算）。"""
+
+        minute = self._minute_now() if minute_of_day is None else float(minute_of_day)
+        outcome = self.maintenance.run_cycle(self.clock.now(), minute_of_day=minute)
+        return outcome.as_dict()
+
+    def _minute_now(self) -> float:
+        return (self.clock.now() / 60.0) % 1440.0
+
     def note_error(self, error: PlantError) -> dict:
         """把平台异常写入审计，返回落盘记录。"""
 
@@ -816,6 +953,42 @@ class Platform:
         if not self.store.exists("platform_state"):
             return False
         return self.store.remove("platform_state")
+
+
+class _FieldMaintenanceAdapter:
+    """把检修协调器需要的执行接口适配到 FieldController。"""
+
+    def __init__(self, field: FieldController) -> None:
+        self._field = field
+
+    def exit_focus(self, mirrors, job_id, zone, basis):
+        return self._field.maintenance_exit(mirrors, job_id, zone, basis)
+
+    def return_focus(self, mirrors, job_ids):
+        return self._field.maintenance_return(mirrors, job_ids)
+
+    def held_maintenance(self):
+        return self._field.held_maintenance()
+
+    def manual_mirrors(self):
+        return self._field.manual_mirrors()
+
+
+def _audit_clean(payload: dict) -> dict:
+    """整理审计载荷：保留完整退出依据（含每镜命中证据），去掉冗余整票。"""
+
+    clean: dict = {}
+    for key, value in payload.items():
+        if key == "job":
+            continue
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            clean[key] = value
+        elif isinstance(value, (list, tuple)):
+            clean[key] = list(value)
+        elif key in ("basis", "position") and isinstance(value, dict):
+            # 依据必须与执行集合同源，整份落盘以便巡检逐镜复核。
+            clean[key] = value
+    return clean
 
 
 def build_plant(

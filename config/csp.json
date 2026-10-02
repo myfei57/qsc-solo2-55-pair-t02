@@ -22,7 +22,13 @@
       "focus_threshold_w_m2": 320.0,
       "dispatch_rate_pct_s": 6.0,
       "sweep_batch": 12,
-      "safe_zone_margin_m": 6.0
+      "safe_zone_margin_m": 6.0,
+      "maintenance_lead_s": 120.0,
+      "maintenance_reach_m": 24.0,
+      "maintenance_crew_speed_m_s": 0.5,
+      "maintenance_crew_expansion_max_m": 30.0,
+      "maintenance_sample_step_s": 15.0,
+      "maintenance_position_stale_s": 60.0
     },
     "receiver": {
       "temp_target_c": 600.0,

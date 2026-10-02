@@ -56,6 +56,13 @@ class Api:
         add("GET", "/api/store", self._store)
         add("GET", "/api/readiness", self._readiness)
         add("GET", "/api/window", lambda params, body: {"mirrors": self._platform.mirrors_in_window()})
+        add("GET", "/api/maintenance", self._maintenance_status)
+        add("POST", "/api/maintenance/open", self._maintenance_open)
+        add("POST", "/api/maintenance/position", self._maintenance_position)
+        add("POST", "/api/maintenance/complete", self._maintenance_complete)
+        add("POST", "/api/maintenance/interrupt", self._maintenance_interrupt)
+        add("POST", "/api/maintenance/resume", self._maintenance_resume)
+        add("POST", "/api/maintenance/cycle", self._maintenance_cycle)
         add("POST", "/api/track", self._track)
         add("POST", "/api/circulate", self._circulate)
         add("POST", "/api/cycle", self._cycle)
@@ -248,6 +255,56 @@ class Api:
         mirrors = body.get("mirrors")
         batch = None if not mirrors else [str(item) for item in mirrors]
         return self._platform.wash(batch, str(body.get("zone", "maint-north")))
+
+    # ---- 检修作业避让 -------------------------------------------------
+
+    def _opt_float(self, body: dict, key: str):
+        value = body.get(key)
+        return None if value is None else float(value)
+
+    def _maintenance_status(self, params: dict, body: dict) -> dict:
+        return self._platform.status()["maintenance"]
+
+    def _maintenance_open(self, params: dict, body: dict) -> dict:
+        return self._platform.open_maintenance(
+            str(body["job_id"]),
+            start_minute=float(body["start_minute"]),
+            end_minute=float(body["end_minute"]),
+            x_m=float(body["x_m"]),
+            y_m=float(body["y_m"]),
+            radius_m=float(body.get("radius_m", 20.0)),
+            zone=str(body.get("zone", "maintenance")),
+            kind=str(body.get("kind", "routine")),
+            minute_of_day=self._opt_float(body, "minute_of_day"),
+        )
+
+    def _maintenance_position(self, params: dict, body: dict) -> dict:
+        return self._platform.report_maintenance_position(
+            str(body["job_id"]),
+            float(body["x_m"]),
+            float(body["y_m"]),
+            minute_of_day=self._opt_float(body, "minute_of_day"),
+        )
+
+    def _maintenance_complete(self, params: dict, body: dict) -> dict:
+        return self._platform.complete_maintenance(
+            str(body["job_id"]), minute_of_day=self._opt_float(body, "minute_of_day")
+        )
+
+    def _maintenance_interrupt(self, params: dict, body: dict) -> dict:
+        return self._platform.interrupt_maintenance(
+            str(body["job_id"]), minute_of_day=self._opt_float(body, "minute_of_day")
+        )
+
+    def _maintenance_resume(self, params: dict, body: dict) -> dict:
+        return self._platform.resume_maintenance(
+            str(body["job_id"]), minute_of_day=self._opt_float(body, "minute_of_day")
+        )
+
+    def _maintenance_cycle(self, params: dict, body: dict) -> dict:
+        return self._platform.maintenance_cycle(
+            minute_of_day=self._opt_float(body, "minute_of_day")
+        )
 
     def _trip(self, params: dict, body: dict) -> dict:
         return self._platform.trip(str(body.get("reason", "overtemperature")))

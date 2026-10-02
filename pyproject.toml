@@ -26,4 +26,5 @@ packages = [
     "cspplant.alarm",
     "cspplant.sequence",
     "cspplant.console",
+    "cspplant.maintenance",
 ]

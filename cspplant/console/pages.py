@@ -11,7 +11,7 @@ from html import escape
 
 from ..app import Platform
 
-PAGE_PATHS: tuple[str, ...] = ("/", "/receiver", "/salt", "/alarms")
+PAGE_PATHS: tuple[str, ...] = ("/", "/receiver", "/salt", "/maintenance", "/alarms")
 
 _STYLE = """
 body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; background: #0f1720; color: #e6edf3; }
@@ -45,6 +45,7 @@ def _shell(title: str, body: str) -> str:
             ("/", "镜场"),
             ("/receiver", "吸热器"),
             ("/salt", "熔盐"),
+            ("/maintenance", "检修"),
             ("/alarms", "告警"),
         )
     )
@@ -147,10 +148,78 @@ def _alarm_page(platform: Platform) -> str:
     return _shell("告警控制台", body)
 
 
+_STATE_LABEL = {
+    "scheduled": "已排程",
+    "active": "在役",
+    "completed": "已完成",
+    "interrupted": "中断(未完成)",
+}
+
+
+def _maintenance_page(platform: Platform) -> str:
+    """检修页：作业票、推进位置、退出/放回镜子与几何参数。"""
+
+    maint = platform.status()["maintenance"]
+    sweep = maint["sweep"]
+    head = [
+        ("在役作业", ", ".join(maint["active"]) or "-"),
+        ("未完成作业", ", ".join(maint["unfinished"]) or "-"),
+        ("避让持有的镜子数", maint["held_count"]),
+        ("避让镜子", ", ".join(maint["held"]) or "-"),
+        ("提前量 (s)", sweep["lead_s"]),
+        ("镜斑作用距离 (m)", sweep["reach_m"]),
+        ("安全余量 (m)", sweep["margin_m"]),
+        ("人员移动速度 (m/s)", sweep["crew_speed_m_s"]),
+        ("危险盘外扩封顶 (m)", sweep["max_crew_expansion_m"]),
+    ]
+    body = _table("检修避让", head)
+
+    job_rows: list[tuple[str, object]] = []
+    for job in maint["jobs"]:
+        pos = job["position"]
+        mirrors = maint["job_mirrors"].get(job["job_id"], [])
+        job_rows.append(
+            (
+                job["job_id"],
+                f"{_STATE_LABEL.get(job['state'], job['state'])}｜{job['kind']}｜"
+                f"位置 ({pos['x_m']}, {pos['y_m']})｜半径 {job['radius_m']}｜"
+                f"立即重算 {'是' if job['immediate_reposition'] else '否'}｜"
+                f"退出镜 {len(mirrors)}: {', '.join(mirrors) or '-'}",
+            )
+        )
+    body += _table("作业票", job_rows or [("暂无", "-")])
+
+    # 最近的检修避让审计（退出/放回/手动受阻/位置过期）。
+    entries = platform.audit.entries(limit=200)
+    recent = [
+        item
+        for item in entries
+        if item["component"] == "maintenance"
+        and item["action"]
+        in (
+            "maintenance_exit",
+            "maintenance_return",
+            "maintenance_manual_blocked",
+            "maintenance_position_stale",
+            "maintenance_partial_failure",
+        )
+    ][:12]
+    audit_rows = [
+        (
+            f"{item['ts']}",
+            f"[{item['severity']}] {item['action']} {item['message']}",
+        )
+        for item in recent
+    ] or [("暂无", "-")]
+    body += _table("最近退出/放回审计", audit_rows)
+    return _shell("检修避让控制台", body)
+
+
 _RENDERERS = {
     "/": _mirror_page,
     "/receiver": _receiver_page,
     "/salt": _salt_page,
+    "/maintenance": _maintenance_page,
     "/alarms": _alarm_page,
 }
 

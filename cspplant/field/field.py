@@ -68,6 +68,9 @@ class FieldController:
             for mirror in registry.all()
         }
         self._last_decision: StrategyDecision | None = None
+        # 由"检修作业避让"持有的镜子（区别于手动画圈的清洗窗口）。这些镜子
+        # 退出聚焦后，自动追日不得把它们重新对焦；放回由检修协调器显式解除。
+        self._maint_held: set[str] = set()
         self._lock = threading.RLock()
         self._restore()
 
@@ -223,7 +226,7 @@ class FieldController:
             skipped = 0
             for mirror in self._registry.all():
                 drive = self._drives[mirror.name]
-                if drive.excluded or drive.manual:
+                if drive.excluded or drive.manual or mirror.name in self._maint_held:
                     skipped += 1
                     continue
                 target = aim_angles_for(mirror.x_m, mirror.y_m, mirror.z_m, sun, self._aim_point)
@@ -272,7 +275,7 @@ class FieldController:
 
         moved = 0
         for drive in self._drives.values():
-            if drive.manual or drive.excluded:
+            if drive.manual or drive.excluded or drive.name in self._maint_held:
                 continue
             drive.defocus()
             moved += 1
@@ -358,6 +361,112 @@ class FieldController:
                 drive.mark_excluded(False)
             return window
 
+    # ---- 检修作业避让（执行器） ---------------------------------------
+
+    def held_maintenance(self) -> list[str]:
+        """返回当前因检修作业避让而退出聚焦的镜子。"""
+
+        with self._lock:
+            return sorted(self._maint_held)
+
+    def manual_mirrors(self) -> list[str]:
+        """返回当前处于手动接管的镜子。"""
+
+        with self._lock:
+            return sorted(name for name, drive in self._drives.items() if drive.manual)
+
+    def maintenance_exit(
+        self, mirrors: list[str], job_id: str, zone: str, basis: dict | None = None
+    ) -> dict:
+        """让指定镜子退出聚焦（检修避让）。
+
+        落点被避让区挡住的镜子收起（朝下），其余离焦。手动接管的镜子**不被动**：
+        这里不碰它们，只在结果里标为 blocked，交人工处置。时序上调用方保证这一步
+        先于任何放回。返回成功/未到位清单，未到位按部分失败处理。
+        """
+
+        with self._lock:
+            moved: list[str] = []
+            blocked: list[str] = []
+            failed: list[str] = []
+            for name in sorted(dict.fromkeys(mirrors)):
+                if name not in self._drives:
+                    failed.append(name)
+                    continue
+                drive = self._drives[name]
+                if drive.manual:
+                    blocked.append(name)
+                    continue
+                mirror = self._registry.get(name)
+                verdict = self._guard.evaluate(
+                    mirror.x_m, mirror.y_m, drive.azimuth_deg, self._maintenance_reach_m
+                )
+                self._maint_held.add(name)
+                if verdict.allowed:
+                    drive.defocus()
+                else:
+                    drive.stow()
+                moved.append(name)
+            self._settle_maintenance()
+            for name in moved:
+                if not self._drives[name].at_target():
+                    failed.append(name)
+            return {
+                "ok": not failed,
+                "job_id": job_id,
+                "zone": zone,
+                "mirrors": sorted(set(moved) - set(failed)),
+                "moved": moved,
+                "blocked": sorted(blocked),
+                "failed": sorted(set(failed)),
+                "basis": basis or {},
+            }
+
+    def maintenance_return(self, mirrors: list[str], job_ids: list[str] | None = None) -> dict:
+        """解除检修避让、把镜子放回自动追日。
+
+        只解除标记并离焦过渡，**不在这里直接对焦**——下一轮 :meth:`track` 会按
+        当前太阳位置重新下发追日目标，避免在光斑尚未确认离开时抢先对焦。手动
+        接管的镜子仍不被动，留在 blocked 清单里。
+        """
+
+        with self._lock:
+            returned: list[str] = []
+            blocked: list[str] = []
+            failed: list[str] = []
+            for name in sorted(dict.fromkeys(mirrors)):
+                if name not in self._drives:
+                    failed.append(name)
+                    continue
+                drive = self._drives[name]
+                if name not in self._maint_held:
+                    continue
+                if drive.manual:
+                    # 手动接管期间绝不被动；标记也保留，人工释放后需重新求值。
+                    blocked.append(name)
+                    continue
+                self._maint_held.discard(name)
+                drive.mark_excluded(False)
+                returned.append(name)
+            return {
+                "ok": not failed,
+                "job_ids": list(job_ids or []),
+                "mirrors": sorted(set(returned)),
+                "blocked": sorted(blocked),
+                "failed": sorted(set(failed)),
+            }
+
+    def _settle_maintenance(self) -> None:
+        """把检修避让中的镜子推进到退出姿态。"""
+
+        targets = [self._drives[name] for name in self._maint_held if name in self._drives]
+        for _ in range(MAX_STEPS):
+            if not targets or all(drive.at_target() for drive in targets):
+                break
+            for drive in targets:
+                if not drive.manual:
+                    drive.step(1.0)
+
     # ---- 手动接管 -----------------------------------------------------
 
     def manual_aim(
@@ -424,8 +533,12 @@ class FieldController:
 
         return sum(
             1
-            for drive in self._drives.values()
-            if drive.aimed_at_receiver and not drive.excluded and not drive.manual and drive.aligned()
+            for name, drive in self._drives.items()
+            if drive.aimed_at_receiver
+            and not drive.excluded
+            and not drive.manual
+            and name not in self._maint_held
+            and drive.aligned()
         )
 
     def thermal_power_kw(self) -> float:
@@ -468,6 +581,8 @@ class FieldController:
             "mirrors": self._registry.describe(),
             "focusing": self.focusing_count(),
             "excluded": sum(1 for drive in self._drives.values() if drive.excluded),
+            "maintenance_held": len(self._maint_held),
+            "maintenance_mirrors": sorted(self._maint_held),
             "manual": self._manual.count(),
             "manual_leases": [lease.as_dict() for lease in self._manual.held()],
             "windows": len(self._sweeps.windows()),
